@@ -1,9 +1,23 @@
 use anyhow::{Error, Result};
+use reqwest::Client;
+use dotenvy::dotenv;
 use serde_json::{Value, json};
 use tokio::io::{self, AsyncBufReadExt, AsyncWriteExt, BufReader};
 
+struct Config {
+    model: String,
+    url: String,
+    api_key: String,
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Error> {
+    dotenv()?;
+    let config = Config {
+        model: std::env::var("MODEL")?,
+        url: std::env::var("URL")?,
+        api_key: std::env::var("API_KEY")?,
+    };
     let mut history: Vec<Value> = vec![];
     let stdin = io::stdin();
     let mut stdout = io::stdout();
@@ -15,7 +29,7 @@ async fn main() -> Result<(), Error> {
         let mut input = String::new();
         reader.read_line(&mut input).await?;
         history.push(json!({"role": "user", "content": input.trim_end().to_string()}));
-        agent_loop(&mut history).await;
+        let _ = agent_loop(&mut history, &config).await;
         if let Some(last) = history.last() {
             if let Some(Value::Array(arr)) = last.get("content") {
                 for block in arr {
@@ -31,4 +45,23 @@ async fn main() -> Result<(), Error> {
     }
 }
 
-async fn agent_loop(message: &mut Vec<Value>) {}
+async fn agent_loop(message: &mut Vec<Value>, config: &Config) -> Result<(), Error> {
+    let client = Client::new();
+    let response = client
+        .post(&config.url)
+        .header(
+            "Authorization",
+            format!(
+                "Bearer {}",
+                config.api_key
+            ),
+        )
+        .json(
+            &json!({"model": config.model, "messages": message})
+        )
+        .send()
+        .await?;
+    let json = response.json::<Value>().await?;
+    dbg!(&json);
+    Ok(())
+}
