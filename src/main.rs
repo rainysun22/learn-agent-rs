@@ -1,67 +1,81 @@
-use anyhow::{Error, Result};
-use reqwest::Client;
+use anyhow::Result;
 use dotenvy::dotenv;
-use serde_json::{Value, json};
+use learn_agent_rs::agent::{Agent, AgentConfig};
+use learn_agent_rs::tools::default_tool_registry;
 use tokio::io::{self, AsyncBufReadExt, AsyncWriteExt, BufReader};
 
-struct Config {
-    model: String,
-    url: String,
-    api_key: String,
-}
-
 #[tokio::main]
-async fn main() -> Result<(), Error> {
-    dotenv()?;
-    let config = Config {
+async fn main() -> Result<()> {
+    dotenv().ok(); // .env is optional; env vars may be set directly
+
+    let config = AgentConfig {
         model: std::env::var("MODEL")?,
         url: std::env::var("URL")?,
         api_key: std::env::var("API_KEY")?,
+        max_iterations: std::env::var("MAX_ITERATIONS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(10),
     };
-    let mut history: Vec<Value> = vec![];
+
+    let system_prompt = "You are a helpful assistant. You have access to tools you can use \
+                         to help answer questions. When you need external information or \
+                         computation, use the available tools.";
+
+    let mut agent = Agent::new(config, Some(system_prompt));
+    let tools = default_tool_registry();
+
     let stdin = io::stdin();
     let mut stdout = io::stdout();
     let mut reader = BufReader::new(stdin);
 
     loop {
-        stdout.write_all(b"> ").await?;
+        stdout.write_all(b"\n> ").await?;
         stdout.flush().await?;
+
         let mut input = String::new();
-        reader.read_line(&mut input).await?;
-        history.push(json!({"role": "user", "content": input.trim_end().to_string()}));
-        let _ = agent_loop(&mut history, &config).await;
-        if let Some(last) = history.last() {
-            if let Some(Value::Array(arr)) = last.get("content") {
-                for block in arr {
-                    if let Some(text) = block.get("text") {
-                        if let Some(str) = text.as_str() {
-                            stdout.write_all(str.as_bytes()).await?;
-                            stdout.flush().await?;
-                        }
-                    }
-                }
+        let bytes_read = reader.read_line(&mut input).await?;
+
+        // EOF (Ctrl-D) — exit gracefully
+        if bytes_read == 0 {
+            stdout.write_all(b"\nGoodbye!\n").await?;
+            stdout.flush().await?;
+            break;
+        }
+
+        let trimmed = input.trim();
+
+        // Skip empty lines
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        // Allow explicit exit commands
+        if matches!(trimmed, "exit" | "quit" | "q") {
+            stdout.write_all(b"Goodbye!\n").await?;
+            stdout.flush().await?;
+            break;
+        }
+
+        match agent.chat(trimmed, &tools).await {
+            Ok(Some(response)) => {
+                stdout.write_all(response.as_bytes()).await?;
+                stdout.write_all(b"\n").await?;
+                stdout.flush().await?;
+            }
+            Ok(None) => {
+                stdout
+                    .write_all(b"(assistant produced no text response)\n")
+                    .await?;
+                stdout.flush().await?;
+            }
+            Err(e) => {
+                let msg = format!("Error: {e:#}\n");
+                stdout.write_all(msg.as_bytes()).await?;
+                stdout.flush().await?;
             }
         }
     }
-}
 
-async fn agent_loop(message: &mut Vec<Value>, config: &Config) -> Result<(), Error> {
-    let client = Client::new();
-    let response = client
-        .post(&config.url)
-        .header(
-            "Authorization",
-            format!(
-                "Bearer {}",
-                config.api_key
-            ),
-        )
-        .json(
-            &json!({"model": config.model, "messages": message})
-        )
-        .send()
-        .await?;
-    let json = response.json::<Value>().await?;
-    dbg!(&json);
     Ok(())
 }
